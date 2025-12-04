@@ -1,14 +1,33 @@
-# Python caches
+# --- Python & General ---
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 
-# Virtual Environment
 venv/
 env/
+.venv/
 
-# Datasets (if they are huge)
-/datasets/
+.vscode/
+.idea/
+.DS_Store
 
-# Large models
 *.h5
 *.pt
+*.pth
+*.pkl
+saved_tokenizer/
+/datasets/
+/models/
+
+*.log
+*.pot
+*.pyc
+__pycache__/
+db.sqlite3
+media/
+staticfiles/
+
+credentials.json
+client_secret.json
+service_account.json
+.env

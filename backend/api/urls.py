@@ -8,6 +8,7 @@ urlpatterns = [
     path('auth/login/', views.login_view, name='login'),
     path('auth/profile/', views.user_profile_view, name='user-profile'),
     path('faculty/profile/', views.FacultyProfileView.as_view(), name='faculty-profile'),
+    path('analytics/gap-analysis/', views.faculty_gap_analysis, name='gap-analysis'),
 
     # Upload URLs
     path('uploads/', views.DocumentUploadView.as_view(), name='document-uploads'),

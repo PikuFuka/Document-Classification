@@ -1,6 +1,7 @@
 from django.core.mail import send_mail
 from django.conf import settings
 from django.utils.crypto import get_random_string
+from sklearn import logger
 
 def generate_verification_token():
     """Generate a random verification token."""
@@ -23,5 +24,4 @@ def send_verification_email(user_email, verification_token):
     except Exception as e:
         # Log the error appropriately
         print(f"Failed to send verification email to {user_email}: {e}")
-        # In production, use logging instead of print
-        # logger.error(f"Failed to send verification email to {user_email}: {e}")
+        logger.error(f"Failed to send verification email to {user_email}: {e}")

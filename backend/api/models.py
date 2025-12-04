@@ -69,6 +69,7 @@ class DocumentUpload(models.Model):
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
     created_at = models.DateTimeField(default=timezone.now)
     google_sheet_link = models.URLField(blank=True, null=True)
+
     # Evaluation and classification results
     equivalent_percentage = models.CharField(max_length=20, blank=True, null=True)
     total_score = models.FloatField(blank=True, null=True)
@@ -78,6 +79,7 @@ class DocumentUpload(models.Model):
     sub_criteria = models.CharField(max_length=255, blank=True, null=True)
     explanation = models.TextField(blank=True, null=True)
     error_message = models.TextField(blank=True, null=True)
+    
     # Extraction details
     page_count = models.IntegerField(blank=True, null=True)
     extracted_text_preview = models.TextField(blank=True, null=True)

@@ -24,7 +24,7 @@ class TripleBERTClassifier(nn.Module):
 
 def load_model_and_encoders():
     try:
-        model_path = os.path.join(settings.BASE_DIR, 'api', 'ml_models', 'bert_triple_modelUse.pt')
+        model_path = os.path.join(settings.BASE_DIR, 'api', 'ml_models', 'bert_hierarchical_model.pt')
         kra_encoder_path = os.path.join(settings.BASE_DIR, 'api', 'ml_models', 'kra_encoder.pkl')
         crit_encoder_path = os.path.join(settings.BASE_DIR, 'api', 'ml_models', 'crit_encoder.pkl')
         sub_encoder_path = os.path.join(settings.BASE_DIR, 'api', 'ml_models', 'sub_encoder.pkl')

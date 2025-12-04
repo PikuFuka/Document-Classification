@@ -16,6 +16,10 @@ from .admin_views import (
     admin_user_documents
 )
 
+from .analytics_views import (
+    faculty_gap_analysis
+)
+
 # Define what gets imported with "from .views import *"
 __all__ = [
     'FacultyRegistrationView',
@@ -27,5 +31,6 @@ __all__ = [
     'user_uploads_list',
     'admin_dashboard_stats',
     'admin_users_list',
-    'admin_user_documents'
+    'admin_user_documents',
+    'faculty_gap_analysis'
 ]

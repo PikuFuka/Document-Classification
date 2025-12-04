@@ -1,22 +1,42 @@
-# api/services/document_processing_service.py
 import os
 import uuid
 import io
 import pytesseract
-import uuid
+import logging
+import json
+import fitz  # PyMuPDF
+from datetime import datetime
 from PIL import Image, ImageFilter, ImageOps
 from django.conf import settings
 from googleapiclient.discovery import build
-from .ml_processing_service import classify_document
-from .google_sheets_service import send_evaluation_to_spreadsheetKRA1_Eval, normalize_values
-import logging
+from google.oauth2 import service_account  
+from googleapiclient.http import MediaIoBaseDownload
+
 from docx import Document
-import json
-import fitz
+from .ml_processing_service import classify_document
+from .google_sheets_service import send_evaluation_to_spreadsheetKRA1_Eval, normalize_values, send_research_to_sheet, send_program_contribution_to_sheet
 from .extraction_strategies import route_extraction
 from .scoring_rules import calculate_score, SCORING_RULES
 
 logger = logging.getLogger(__name__)
+
+# Scopes required for the Service Account
+SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
+
+def get_drive_service():
+    """Authenticates using Service Account Credentials."""
+    try:
+        if not hasattr(settings, 'GOOGLE_SERVICE_ACCOUNT_FILE'):
+            raise ValueError("GOOGLE_SERVICE_ACCOUNT_FILE not found in settings.")
+            
+        creds = service_account.Credentials.from_service_account_file(
+            settings.GOOGLE_SERVICE_ACCOUNT_FILE, 
+            scopes=SCOPES
+        )
+        return build('drive', 'v3', credentials=creds)
+    except Exception as e:
+        logger.error(f"Failed to authenticate with Service Account: {e}")
+        raise e
 
 def extract_text_from_drive(drive_link):
     """
@@ -56,7 +76,12 @@ def extract_text_from_drive(drive_link):
 
 def extract_text_from_drive_file(file_id):
     """Extract text from a single file and return file info dict."""
-    service = build('drive', 'v3', developerKey=settings.GOOGLE_API_KEY)
+    # Use the new helper function for auth
+    try:
+        service = get_drive_service()
+    except Exception as auth_error:
+        print(f"Authentication failed: {auth_error}")
+        return None
 
     try:
         file_metadata = service.files().get(fileId=file_id, fields="name, mimeType").execute()
@@ -80,13 +105,19 @@ def extract_text_from_drive_file(file_id):
             print(f"Unsupported file type: {mime_type}")
             return None
 
+        # --- UPDATED DOWNLOAD LOGIC ---
+        # Using MediaIoBaseDownload is more robust than request.execute() for files
         request = service.files().get_media(fileId=file_id)
         os.makedirs(settings.MEDIA_ROOT, exist_ok=True)
         temp_path = os.path.join(settings.MEDIA_ROOT, f"{uuid.uuid4()}_{file_name}")
 
-        with open(temp_path, 'wb') as f:
-            downloader = request.execute()
-            f.write(downloader)
+        with io.FileIO(temp_path, 'wb') as fh:
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while done is False:
+                status, done = downloader.next_chunk()
+                # Optional: print(f"Download {int(status.progress() * 100)}%.")
+        # ------------------------------
 
         # Extract text and page count based on file type
         text = ""
@@ -123,15 +154,15 @@ def extract_text_from_drive_file(file_id):
 
     except Exception as e:
         print(f"Error processing file {file_id}: {e}")
-        import traceback
-        traceback.print_exc()
+        # traceback.print_exc() # detailed logging
         return None
 
 
 def extract_files_from_drive_folder(folder_id):
     """Extract files from folder and return list of file info dicts."""
     try:
-        service = build('drive', 'v3', developerKey=settings.GOOGLE_API_KEY)
+        # Use the new helper function for auth
+        service = get_drive_service()
 
         query = (
             f"'{folder_id}' in parents and "
@@ -168,21 +199,16 @@ def extract_files_from_drive_folder(folder_id):
 
     except Exception as e:
         print(f"Error processing folder {folder_id}: {e}")
-        import traceback
-        traceback.print_exc()
+        # traceback.print_exc()
         return []
 
 
 def preprocess_for_ocr(img: Image.Image) -> Image.Image:
     """Preprocess image for better OCR results."""
     try:
-        # Convert to grayscale
         gray = img.convert("L")
-        # Increase contrast
         gray = ImageOps.autocontrast(gray)
-        # Apply median filter to reduce noise
         gray = gray.filter(ImageFilter.MedianFilter(size=3))
-        # Binarize
         threshold = gray.point(lambda x: 0 if x < 160 else 255, "1")
         return threshold
     except Exception as e:
@@ -275,9 +301,12 @@ def extract_text_from_image(file_path):
         return ""
 
 def map_classification_to_evidence_type(classification_result):
-    primary_kra = classification_result.get("primary_kra")
-    criterion = classification_result.get("criterion")
-    sub_criterion = classification_result.get("sub_criterion")
+    pk = classification_result.get("primary_kra")
+    cr = classification_result.get("criterion")
+    sc = classification_result.get("sub_criterion")
+
+    if pk == "2" and cr == "A" and sc.startswith("1."):
+        return "kra2a_research"
 
     mapping = {
         ("1", "A", "1.1"): "kra1a_evaluation",
@@ -299,15 +328,6 @@ def map_classification_to_evidence_type(classification_result):
         ("1", "C", "1.2"): "kra1c_panel",   
         ("1", "C", "2"): "kra1c_mentor",   
 
-        ("2", "A", "1.1"): "kra2a_sole",
-        ("2", "A", "1.2"): "kra2a_co",
-        ("2", "A", "1.3"): "kra2a_sole",
-        ("2", "A", "1.4"): "kra2a_co",
-        ("2", "A", "1.5"): "kra2a_sole",
-        ("2", "A", "1.6"): "kra2a_co",
-        ("2", "A", "1.7"): "kra2a_sole",
-        ("2", "A", "1.8"): "kra2a_co",
-        ("2", "A", "1.9"): "kra2a_co",
         ("2", "A", "2.1"): "kra2a_research_to_project_lead",
         ("2", "A", "2.2"): "kra2a_research_to_project_contributor",
         ("2", "A", "3.1"): "kra2a_citation_local",
@@ -333,15 +353,8 @@ def map_classification_to_evidence_type(classification_result):
         ("2", "C", "1.4.4"): "kra2c_literary",
     }
 
-    evidence_type = mapping.get((primary_kra, criterion, sub_criterion))
-
-    if not evidence_type:
-        print(f"Warning: No specific mapping found for KRA={primary_kra}, Criterion={criterion}, Sub={sub_criterion}. Using fallback or None.")
-        text_sample = classification_result.get("text_sample", "")
-        if primary_kra == "1" and criterion == "A":
-             return "kra1a_evaluation"
-
-    return evidence_type
+    ev_type = mapping.get((pk, cr, sc))    
+    return ev_type
 
 
 def _process_kra1a_evaluation(text, classification_result, upload, extracted_items):
@@ -364,16 +377,132 @@ def _process_kra1b_co(text, classification_result, upload, extracted_items):
     pass # Implement standard scoring loop
 
 def _process_kra1b_program_leadAndContri(text, classification_result, upload, extracted_items):
-    """Process KRA 1B lead and contri Academic Program."""
-    pass # Implement standard scoring loop
+    if not extracted_items:
+        return []
 
-def _process_kra2a_sole(text, classification_result, upload, extracted_items):
-    """Process KRA 2A Sole Research Outputs."""
-    pass # Implement standard scoring loop
+    base = extracted_items[0]
+    sub_crit = str(classification_result.get("sub_criterion", "")).strip()
+    
+    final_role = "Contributor"
+    final_points = 5
+    
+    if sub_crit == "2.1":
+        final_role = "Lead"
+        final_points = 10
+    elif sub_crit == "2.2":
+        final_role = "Contributor"
+        final_points = 5
+    else:
+        raw_role = base.get("role", "Contributor")
+        if raw_role.lower() == "lead":
+            final_role = "Lead"
+            final_points = 10
 
-def _process_kra2a_co(text, classification_result, upload, extracted_items):
-    """Process KRA 2A Co Research Outputs."""
-    pass # Implement standard scoring loop
+    upload.total_score = final_points
+
+    processed_item = {
+        "title": base["program_name"], 
+        "description": f"{base['program_type']}. {base['board_resolution']}",
+        "role": final_role, 
+        "points": final_points,
+        "evidence_type": "kra1b_program_leadAndContri",
+        "auto_generated": True,
+        
+        "extracted_raw": {
+            "program_name": base["program_name"],
+            "program_type": base["program_type"],
+            "board_resolution": base["board_resolution"],
+            "academic_year": base["academic_year"],
+            "role": final_role
+        }
+    }
+
+    return [processed_item]
+
+def _process_kra2a_research(text, classification_result, upload, extracted_items):
+    """
+    Unified Processor for KRA 2A (Research).
+    STRICTLY determines Type based on Sub-criterion code.
+    """
+    if not extracted_items: return []
+    item = extracted_items[0]
+    
+    # 1. Get the Sub-Criterion Code
+    sub_crit = str(classification_result.get("sub_criterion", "")).strip()
+    
+    # 2. STRICT TYPE MAPPING (The Fix)
+    # This dictionary maps the ML Code -> Exact String required by Google Sheets
+    STRICT_TYPE_MAP = {
+        "1.1": "Book",
+        "1.2": "Book",
+        "1.3": "Journal Article",
+        "1.4": "Journal Article",
+        "1.5": "Book Chapter",
+        "1.6": "Book Chapter",
+        "1.7": "Monograph",
+        "1.8": "Monograph",
+        "1.9": "Other Peer-Reviewed Output"
+    }
+    
+    # Force the type. If code is unknown/missing, default to "Journal Article" (Safe fallback)
+    # We DO NOT look at item['type_hint'] from the LLM anymore.
+    final_research_type = STRICT_TYPE_MAP.get(sub_crit, "Journal Article")
+
+    # 3. Determine Mode (Sole vs Co) logic... (Keep existing logic)
+    extracted_contrib = item.get("contribution", 0)
+    
+    SOLE_CODES = ["1.1", "1.3", "1.5", "1.7"]
+    CO_CODES   = ["1.2", "1.4", "1.6", "1.8"]
+    
+    if sub_crit in SOLE_CODES:
+        mode = "sole"
+        extracted_contrib = 100
+    elif sub_crit in CO_CODES:
+        mode = "co"
+    elif sub_crit == "1.9":
+        # 1.9 is flexible: Sole if ~100%, Co if less
+        mode = "sole" if extracted_contrib >= 99 else "co"
+    else:
+        mode = "sole" if extracted_contrib == 100 else "co"
+
+    # 4. Calculate Score (Keep existing logic)
+    BASE_SCORES = {
+        "1.1": 100, "1.3": 50, "1.5": 35, "1.7": 100,
+        "1.2": 100, "1.4": 50, "1.6": 35, "1.8": 100,
+        "1.9": 10
+    }
+    base_points = BASE_SCORES.get(sub_crit, 35)
+
+    if mode == "sole":
+        final_score = base_points
+        role_display = "Sole Author"
+        extracted_contrib = 100
+    else:
+        final_score = base_points * (extracted_contrib / 100.0)
+        role_display = f"Co-Author ({extracted_contrib}%)"
+    
+    final_score = round(final_score, 2)
+    upload.total_score = final_score
+    
+    # 5. Save Data (Including the FORCED Type)
+    raw_data = item.copy()
+    raw_data['author_mode'] = mode
+    raw_data['contribution'] = extracted_contrib
+    
+    # CRITICAL: Save the forced type here so the Sheet Export uses it
+    raw_data['final_research_type'] = final_research_type 
+
+    processed_item = {
+        "title": item["title"],
+        "description": f"{role_display}. Type: {final_research_type}. Code: {sub_crit}",
+        "role": role_display,
+        "points": final_score,
+        "evidence_type": "kra2a_research",
+        "auto_generated": True,
+        "extracted_raw": raw_data
+    }
+    
+    return [processed_item]
 
 def _process_kra2a_research_to_project_lead(text, classification_result, upload, extracted_items):
     """Process KRA 2A Lead Research-to-Project."""
@@ -450,8 +579,7 @@ PROCESSING_STRATEGIES = {
     "kra1b_sole": _process_kra1b_sole,
     "kra1b_co": _process_kra1b_co,
     "kra1b_program_leadAndContri": _process_kra1b_program_leadAndContri,
-    "kra2a_sole": _process_kra2a_sole,
-    "kra2a_co": _process_kra2a_co,
+    "kra2a_research": _process_kra2a_research,
     "kra2a_research_to_project_lead": _process_kra2a_research_to_project_lead,
     "kra2a_research_to_project_contributor": _process_kra2a_research_to_project_contributor,
     "kra2a_citation_local": _process_kra2a_citation_local,
@@ -471,78 +599,8 @@ PROCESSING_STRATEGIES = {
     # Add other specific types as they are implemented
 }
 
-def process_single_file(file_info, upload, faculty_full_name):
-    """Process a single file and return its results."""
-    text = file_info['text']
-    page_count = file_info['page_count']
-    file_name = file_info['file_name']
-    file_id = file_info['file_id']
-
-    try:
-        classification_result = classify_document(text)
-        print(f"Classification Result for {file_name}: {classification_result}")
-
-        classification_result["text_sample"] = text
-        evidence_type = map_classification_to_evidence_type(classification_result)
-        print(f"Mapped Evidence Type: {evidence_type}")
-
-        extracted_data = []
-        total_score = 0.0
-
-        if evidence_type:
-            try:
-                raw_extracted_items = route_extraction(evidence_type, text, faculty_name=faculty_full_name)
-                
-                # Create temporary upload object
-                class TempUpload:
-                    def __init__(self):
-                        self.total_score = 0.0
-                        self.equivalent_percentage = None
-                
-                temp_upload = TempUpload()
-                
-                # Get processing function
-                processing_func = PROCESSING_STRATEGIES.get(evidence_type, _process_fallback)
-                extracted_data = processing_func(text, classification_result, temp_upload, raw_extracted_items)
-                total_score = temp_upload.total_score
-                
-            except Exception as extract_error:
-                print(f"Error during extraction/processing: {extract_error}")
-                import traceback
-                traceback.print_exc()
-
-        return {
-            'file_name': file_name,
-            'file_id': file_id,
-            'page_count': page_count,
-            'classification': classification_result,
-            'evidence_type': evidence_type,
-            'extracted_data': extracted_data,
-            'total_score': total_score,
-            'text_preview': text[:500] + "..." if len(text) > 500 else text
-        }
-        
-    except Exception as e:
-        print(f"Error processing single file {file_name}: {e}")
-        import traceback
-        traceback.print_exc()
-        
-        return {
-            'file_name': file_name,
-            'file_id': file_id,
-            'page_count': page_count,
-            'classification': {'error': str(e)},
-            'evidence_type': None,
-            'extracted_data': [],
-            'total_score': 0.0,
-            'text_preview': text[:500] if text else ""
-        }
-
-
 def process_document_upload(upload):
-    """Process document upload with multiple files support."""
     try:
-        # Extract files
         file_info_list = extract_text_from_drive(upload.google_drive_link)
         
         if not file_info_list:
@@ -553,84 +611,233 @@ def process_document_upload(upload):
 
         faculty_full_name = f"{upload.user.first_name} {upload.user.last_name}".strip()
         
-        # Process each file
-        all_results = []
-        total_pages = 0
-        combined_score = 0.0
+        print(f"\n--- SCANNING {len(file_info_list)} FILES ---")
 
-        for idx, file_info in enumerate(file_info_list):
-            print(f"\n{'='*60}")
-            print(f"Processing file {idx+1}/{len(file_info_list)}: {file_info['file_name']}")
-            print(f"{'='*60}\n")
+        priority_file = None
+        supporting_files = []
+        
+        final_extraction_files = [] 
+
+        for f in file_info_list:
+            fname = f['file_name'].lower()
+            text = f['text'].lower()
             
-            file_result = process_single_file(file_info, upload, faculty_full_name)
-            all_results.append(file_result)
-            total_pages += file_result['page_count']
-            combined_score += file_result['total_score']
+            is_cert = "certifi" in fname or "this is to certify" in text
+            
+            is_research = "abstract" in text or "introduction" in text and len(text) > 1000
+            
+            is_reso = "resolution" in text and ("board" in text or "no." in text)
 
-        # Update upload
+            if is_cert:
+                print(f"-> Found PRIORITY File: {f['file_name']}")
+                if not priority_file:
+                    priority_file = f
+                final_extraction_files.append(f)
+                
+            elif is_research and not priority_file:
+                print(f"-> Found PRIORITY File (Research): {f['file_name']}")
+                priority_file = f
+                final_extraction_files.append(f)
+                
+            elif is_reso:
+                print(f"-> Found SUPPORTING File: {f['file_name']}")
+                supporting_files.append(f)
+                final_extraction_files.append(f)
+                
+            else:
+                final_extraction_files.append(f)
+
+        if not priority_file and file_info_list:
+            priority_file = file_info_list[0]
+            print(f"-> No specific priority detected. Using first file as anchor: {priority_file['file_name']}")
+
+        print(f"\n--- CLASSIFYING SINGLE FILE: {priority_file['file_name']} ---")
+        classification_result = classify_document(priority_file['text'])
+        
+        if classification_result.get('primary_kra') == "1":
+            p_text = priority_file['text'].lower()
+            if "degree" in p_text or "program" in p_text or "curriculum" in p_text:
+                if classification_result.get('sub_criterion') != "2.1":
+                    print("-> Correction: Detected 'Program/Degree' keywords. Forcing Evidence Type to Program.")
+                    classification_result['criterion'] = "B"
+                    classification_result['sub_criterion'] = "2.1"
+
+        evidence_type = map_classification_to_evidence_type(classification_result)
+        print(f"Determined Evidence Type: {evidence_type}")
+
+        combined_text = ""
+        total_pages = 0
+        file_names = []
+        
+        sorted_files = [priority_file] + [f for f in final_extraction_files if f != priority_file]
+
+        for f in sorted_files:
+            combined_text += f"\n\n--- FILE: {f['file_name']} ---\n"
+            combined_text += f['text']
+            total_pages += f['page_count']
+            file_names.append(f['file_name'])
+
+        extracted_data = []
+        upload.total_score = 0.0 
+
+        if evidence_type:
+            try:
+                raw_items = route_extraction(evidence_type, combined_text, faculty_name=faculty_full_name)
+                
+                processor = PROCESSING_STRATEGIES.get(evidence_type, _process_fallback)
+                extracted_data = processor(combined_text, classification_result, upload, raw_items)
+            except Exception as e:
+                print(f"Extraction error: {e}")
+                import traceback
+                traceback.print_exc()
+
         upload.status = "completed"
         upload.page_count = total_pages
-        upload.total_score = combined_score
+        upload.primary_kra = classification_result.get("primary_kra")
+        upload.kra_confidence = classification_result.get("confidence")
+        upload.criteria = classification_result.get("criterion")
+        upload.sub_criteria = classification_result.get("sub_criterion")
         
-        if all_results:
-            first_result = all_results[0]
-            upload.primary_kra = first_result['classification'].get("primary_kra")
-            upload.kra_confidence = first_result['classification'].get("confidence")
-            upload.criteria = first_result['classification'].get("criterion")
-            upload.sub_criteria = first_result['classification'].get("sub_criterion")
-            upload.explanation = f"Processed {len(all_results)} file(s). First: {first_result['classification'].get('explanation', 'N/A')}"
-            upload.extracted_text_preview = first_result['text_preview']
-
+        upload.explanation = f"Classified using '{priority_file['file_name']}'. Extracted data from {len(sorted_files)} files."
+        upload.extracted_text_preview = combined_text[:500] + "..."
         upload.error_message = None
+
+        unified_result = {
+            'file_name': f"Group: {', '.join(file_names)}",
+            'file_id': "BATCH_GROUP",
+            'page_count': total_pages,
+            'classification': classification_result,
+            'evidence_type': evidence_type,
+            'extracted_data': extracted_data,
+            'total_score': upload.total_score,
+            'text_preview': combined_text[:200]
+        }
         
-        # Save results as JSON
         upload.extracted_json = json.dumps({
-            'file_count': len(all_results),
-            'files': all_results
+            'file_count': len(sorted_files),
+            'files': [unified_result]
         }, indent=2)
         
         upload.save()
 
-        # Send to Google Sheets
         if hasattr(upload.user, "faculty_profile") and getattr(upload.user.faculty_profile, "sheet_url", None):
-            sheet_url = upload.user.faculty_profile.sheet_url
-            spreadsheet_id = sheet_url.split("/d/")[1].split("/")[0] if "/d/" in sheet_url else sheet_url
+                    sheet_url = upload.user.faculty_profile.sheet_url
+                    spreadsheet_id = sheet_url.split("/d/")[1].split("/")[0] if "/d/" in sheet_url else sheet_url
+                    folder_link = upload.google_drive_link
 
-            for file_result in all_results:
-                if file_result['evidence_type'] == "kra1a_evaluation" and file_result['extracted_data']:
                     try:
-                        info = file_result['extracted_data'][0]
-                        semester_ay = info.get("semester_ay", "")
-                        total_score = info.get("total_score", 0)
-                        evaluation_type_raw = info.get("evaluation_type", "")
 
-                        parts = semester_ay.lower().replace("a.y.", "").split()
-                        semester_raw = parts[0] if len(parts) > 0 else "1st"
-                        academic_year_raw = parts[-1] if len(parts) > 0 else "2022-2023"
+                        if evidence_type == "kra1a_evaluation" and extracted_data:
+                            print(f"-> Sending KRA 1A to Sheets...")
+                            info = extracted_data[0] # Take first item
+                            
+                            parts = info.get("semester_ay", "").lower().replace("a.y.", "").split()
+                            semester_raw = parts[0] if len(parts) > 0 else "1st"
+                            ay_raw = parts[-1] if len(parts) > 0 else "2023-2024"
+                            
+                            ay, sem, eval_type = normalize_values(ay_raw, semester_raw, info.get("evaluation_type", ""))
+                            
+                            send_evaluation_to_spreadsheetKRA1_Eval(
+                                spreadsheet_id=spreadsheet_id,
+                                academic_year=ay,
+                                semester=sem,
+                                evaluation_type=eval_type,
+                                total_score=info.get("total_score", 0),
+                                drive_link=folder_link
+                            )
 
-                        academic_year, semester, evaluation_type = normalize_values(
-                            academic_year_raw, semester_raw, evaluation_type_raw
-                        )
+                        elif evidence_type == "kra1b_program_leadAndContri" and extracted_data:
+                            print(f"-> Sending KRA 1B (Program) to Sheets...")
+                            
+                            # Loop in case multiple items exist (though logic limits to 1)
+                            for item in extracted_data:
+                                raw = item.get("extracted_raw", {})
+                                
+                                send_program_contribution_to_sheet(
+                                    spreadsheet_id=spreadsheet_id,
+                                    program_name=item.get('title', 'Unknown Program'),
+                                    program_type=raw.get('program_type', 'Revised Program'),
+                                    board_reso=raw.get('board_resolution', 'N/A'),
+                                    academic_year=raw.get('academic_year', 'N/A'),
+                                    role=item.get('role', 'Contributor'),
+                                    score=item.get('points', 0),
+                                    drive_link=folder_link  # Points to the Folder
+                                )
 
-                        send_evaluation_to_spreadsheetKRA1_Eval(
-                            spreadsheet_id=spreadsheet_id,
-                            academic_year=academic_year,
-                            semester=semester,
-                            evaluation_type=evaluation_type,
-                            total_score=total_score,
-                            drive_link=f"https://drive.google.com/file/d/{file_result['file_id']}/view",
-                        )
+                        elif evidence_type == "kra2a_research" and extracted_data:
+                            print(f"-> Sending KRA 2A Research to Sheets ({len(extracted_data)} items)...")
+                            
+                            for item in extracted_data:
+                                raw = item.get("extracted_raw", {})
+                                
+                                mode = raw.get('author_mode', 'sole')
+                                # Use the FORCED type from the processor
+                                r_type = raw.get("final_research_type")
+                                
+                                # --- DATA SANITIZATION START ---
+                                
+                                # 1. Base Cleaning (N/A -> Empty)
+                                reviewer_clean = raw.get('reviewer', '')
+                                if reviewer_clean == "N/A": reviewer_clean = ""
+                                
+                                indexing_clean = raw.get('indexing', '')
+                                if indexing_clean == "N/A": indexing_clean = ""
+                                
+                                journal_clean = raw.get('journal', '')
+                                if journal_clean == "N/A": journal_clean = ""
+
+                                # 2. RULE ENFORCER (The Fix)
+                                # If type is Journal, Reviewer MUST be empty.
+                                if r_type == "Journal Article":
+                                    reviewer_clean = "" 
+                                
+                                # If type is Other Peer-Reviewed, Indexing MUST be empty.
+                                if r_type == "Other Peer-Reviewed Output":
+                                    indexing_clean = ""
+
+                                # 3. Date Fix
+                                date_clean = raw.get('date_published', '')
+                                
+                                try:
+                                    if date_clean and date_clean != "N/A":
+                                        # Check for YYYY-MM-DD
+                                        if "-" in date_clean and len(date_clean.split("-")) == 3:
+                                            date_obj = datetime.strptime(date_clean.strip(), "%Y-%m-%d")
+                                            date_clean = date_obj.strftime("%m/%d/%Y")
+                                        # Check for Month DD, YYYY
+                                        elif "," in date_clean:
+                                            date_obj = datetime.strptime(date_clean.strip(), "%B %d, %Y")
+                                            date_clean = date_obj.strftime("%m/%d/%Y")
+                                except Exception:
+                                    pass # Keep original if parsing fails
+
+                                if date_clean and len(date_clean.strip()) == 4 and date_clean.strip().isdigit():
+                                    date_clean = f"01/01/{date_clean.strip()}"
+                                elif date_clean == "N/A":
+                                    date_clean = ""
+                                
+                                # --- DATA SANITIZATION END ---
+
+                                send_research_to_sheet(
+                                    spreadsheet_id=spreadsheet_id,
+                                    title=item.get('title', 'Untitled Research'),
+                                    research_type=r_type,
+                                    journal=journal_clean,
+                                    reviewer=reviewer_clean, # Sent as "" if Journal Article
+                                    indexing=indexing_clean, # Sent as "" if Other Output
+                                    date_published=date_clean,
+                                    score=item.get('points', 0),
+                                    drive_link=folder_link,
+                                    author_mode=mode,
+                                    contribution=raw.get('contribution', 0)
+                                )
+
                     except Exception as sheet_error:
                         print(f"Error sending to Google Sheets: {sheet_error}")
                         import traceback
                         traceback.print_exc()
 
-        print(f"\n{'='*60}")
-        print(f"Successfully processed {len(all_results)} file(s)")
-        print(f"Total combined score: {combined_score}")
-        print(f"{'='*60}\n")
-
+        print(f"Processing Complete. Score: {upload.total_score}")
         return True
 
     except Exception as e:
@@ -638,6 +845,4 @@ def process_document_upload(upload):
         upload.error_message = str(e)
         upload.save()
         logger.error(f"Error processing upload {upload.id}: {e}")
-        import traceback
-        traceback.print_exc()
         return False
