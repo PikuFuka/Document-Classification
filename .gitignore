@@ -1,0 +1,27 @@
+# --- Python & Backend ---
+__pycache__/
+*.py[cod]
+*$py.class
+backend/venv/
+backend/venom/
+backend/.env
+backend/credentials.json
+backend/media/
+*.h5
+*.pt
+*.pth
+*.pkl
+*.log
+
+# --- Node/Frontend ---
+frontend/node_modules/
+frontend/.env
+frontend/.env.local
+frontend/build/
+frontend/dist/
+
+# --- IDE & OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
